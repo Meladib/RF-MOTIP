@@ -97,14 +97,23 @@ def train_engine(config: dict):
 
     # Build MOTIP model:
     model, detr_criterion = build_motip(config=config)
-    # Load the pre-trained DETR:
-    load_detr_pretrain(
-        model=model, pretrain_path=config["DETR_PRETRAIN"], num_classes=config["NUM_CLASSES"],
-        default_class_idx=config["DETR_DEFAULT_CLASS_IDX"] if "DETR_DEFAULT_CLASS_IDX" in config else None,
-    )
-    logger.success(
-        log=f"Load the pre-trained DETR from '{config['DETR_PRETRAIN']}'. "
-    )
+    # Load the pre-trained DETR.
+    # Skip for rf_detr: the fine-tuned weights are already loaded from
+    # CKPT_PATH inside models/motip/__init__.py build().  A second load
+    # with the MOTIP NUM_CLASSES would corrupt the class_embed weights.
+    if config.get("DETR_FRAMEWORK", "deformable_detr").lower() != "rf_detr":
+        load_detr_pretrain(
+            model=model, pretrain_path=config["DETR_PRETRAIN"], num_classes=config["NUM_CLASSES"],
+            default_class_idx=config["DETR_DEFAULT_CLASS_IDX"] if "DETR_DEFAULT_CLASS_IDX" in config else None,
+        )
+        logger.success(
+            log=f"Load the pre-trained DETR from '{config['DETR_PRETRAIN']}'. "
+        )
+    else:
+        logger.info(
+            "Skipping load_detr_pretrain for rf_detr: "
+            "weights already loaded from CKPT_PATH in build()."
+        )
     # Build Loss Function:
     id_criterion = build_id_criterion(config=config)
 
@@ -673,9 +682,34 @@ def prepare_for_motip(detr_outputs, annotations, detr_indices):
     for b in range(_B):
         for t in range(_T):
             flatten_idx = b * _T + t
-            go_back_detr_idxs = torch.argsort(detr_indices[flatten_idx][1])
-            detr_output_embeds = detr_outputs["outputs"][flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
-            detr_boxes = detr_outputs["pred_boxes"][flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
+            # --- A: extract matched pairs for this frame ---
+            pred_idxs = detr_indices[flatten_idx][0]   # (N_t * G,)
+            gt_idxs   = detr_indices[flatten_idx][1]   # (N_t * G,)
+            # --- B: determine N_t and G_det ---
+            # Derive n_gt from the matcher output rather than trajectory_id_masks:
+            # occlusion augmentation can reduce the visible count in masks below
+            # the true DETR GT count, causing G_det = len/n_gt to be non-integer.
+            if len(pred_idxs) == 0:
+                continue
+            n_gt  = int(gt_idxs.max().item()) + 1   # gt_idxs are 0-indexed
+            G_det = len(pred_idxs) // n_gt           # == group_detr of the detector
+            # --- C: sort by gt_idxs → block layout rows j*G_det..(j+1)*G_det-1 = GT j ---
+            sort_order          = torch.argsort(gt_idxs)
+            sorted_pred_idxs    = pred_idxs[sort_order]
+            sorted_pred_idxs_2d = sorted_pred_idxs.view(n_gt, G_det)   # (N_t, G_det)
+            _gt_query_groups    = sorted_pred_idxs_2d    # retained for Phase 2 aggregation
+            # --- D: select column 0 (first group's match) as the A1 representative ---
+            selected_pred_idxs  = sorted_pred_idxs_2d[:, 0]             # (N_t,)
+            # --- E: gather embeddings/boxes — N_t rows, row j = GT j's features ---
+            detr_output_embeds  = detr_outputs["outputs"][flatten_idx][selected_pred_idxs]    # (N_t, D)
+            detr_boxes          = detr_outputs["pred_boxes"][flatten_idx][selected_pred_idxs]  # (N_t, 4)
+            # Gradient-flow guard (training mode only; integer indexing is differentiable).
+            if detr_outputs["outputs"].requires_grad:
+                assert detr_output_embeds.requires_grad, (
+                    "Gradient flow broken at detr_output_embeds selection. "
+                    "Check that selected_pred_idxs is a long tensor and "
+                    "not accidentally wrapping a detach()."
+                )
             # detr_output_embeds = einops.repeat(detr_output_embeds, "n d -> g n d", g=_G)
             # detr_boxes = einops.repeat(detr_boxes, "n d -> g n d", g=_G)
             for group in range(_G):
