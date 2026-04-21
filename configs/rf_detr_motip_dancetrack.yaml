@@ -15,6 +15,14 @@ DETR_PRETRAIN: null
 # class_embed shape mismatch in load_detr_pretrain.
 NUM_CLASSES: 1
 
+# RF-DETR DINOv2 backbone requires H and W to be divisible by
+# patch_size * num_windows = 16 * 2 = 32 (asserted in dinov2.py).
+# MOTIP's collate_fn reads this from the meta dict and passes it to
+# nested_tensor_from_tensor_list, which rounds H and W up to the
+# nearest multiple of 32 before batch padding.
+# For deformable_detr, leave this absent or 0 (no constraint).
+SIZE_DIVISIBILITY: 32
+
 # Training Strategies:
 EPOCHS: 8
 LR: 1.0e-4
