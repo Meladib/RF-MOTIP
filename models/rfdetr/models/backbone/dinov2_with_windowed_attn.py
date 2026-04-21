@@ -312,9 +312,37 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
             num_w_patches_per_window = num_w_patches // self.config.num_windows
             num_h_patches_per_window = num_h_patches // self.config.num_windows
             num_windows = self.config.num_windows
-            windowed_pixel_tokens = pixel_tokens_with_pos_embed.reshape(batch_size * num_windows, num_h_patches_per_window, num_windows, num_h_patches_per_window, -1)
-            windowed_pixel_tokens = windowed_pixel_tokens.permute(0, 2, 1, 3, 4)
-            windowed_pixel_tokens = windowed_pixel_tokens.reshape(batch_size * num_windows ** 2, num_h_patches_per_window * num_w_patches_per_window, -1)
+            # Correct 4-step windowing for non-square images.
+            # For square images (num_h_patches == num_w_patches) this is
+            # mathematically identical to the original 3-step code.
+            # Step 1: split H into (num_windows_h, h_per_window).
+            windowed_pixel_tokens = pixel_tokens_with_pos_embed.reshape(
+                batch_size,
+                num_windows,
+                num_h_patches_per_window,
+                num_w_patches,
+                -1,
+            )
+            # Step 2: split W into (num_windows_w, w_per_window).
+            windowed_pixel_tokens = windowed_pixel_tokens.reshape(
+                batch_size,
+                num_windows,
+                num_h_patches_per_window,
+                num_windows,
+                num_w_patches_per_window,
+                -1,
+            )
+            # Step 3: group window indices together.
+            # (B, W_h, h_per, W_w, w_per, D) → (B, W_h, W_w, h_per, w_per, D)
+            windowed_pixel_tokens = windowed_pixel_tokens.permute(
+                0, 1, 3, 2, 4, 5
+            ).contiguous()
+            # Step 4: merge batch and window dims; flatten spatial patches.
+            windowed_pixel_tokens = windowed_pixel_tokens.reshape(
+                batch_size * num_windows ** 2,
+                num_h_patches_per_window * num_w_patches_per_window,
+                -1,
+            )
             windowed_cls_token_with_pos_embed = cls_token_with_pos_embed.repeat(num_windows ** 2, 1, 1)
             embeddings = torch.cat((windowed_cls_token_with_pos_embed, windowed_pixel_tokens), dim=1)
 
