@@ -418,8 +418,20 @@ def train_one_epoch(
         detr_outputs = tensor_dict_index_select(detr_outputs, index=go_back_frame_idxs_flatten, dim=0)
 
         # DETR criterion:
+        """
         detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
-
+        """
+        if hasattr(detr_criterion, "group_detr"):
+            _outputs = {k: v for k, v in detr_outputs.items()
+                        if k not in ("aux_outputs", "enc_outputs")}
+            detr_loss_dict, detr_indices = detr_criterion(
+                outputs=_outputs, targets=detr_targets_flatten
+            )
+        else:
+            detr_loss_dict, detr_indices = detr_criterion(
+                outputs=detr_outputs, targets=detr_targets_flatten,
+                batch_len=detr_criterion_batch_len
+            )
         # Whether to only train the DETR, OR to train the MOTIP together:
         if not only_detr:
             _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
