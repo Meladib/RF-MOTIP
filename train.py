@@ -422,11 +422,24 @@ def train_one_epoch(
         detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
         """
         if hasattr(detr_criterion, "group_detr"):
-            _outputs = {k: v for k, v in detr_outputs.items()
-                        if k not in ("aux_outputs", "enc_outputs")}
-            detr_loss_dict, detr_indices = detr_criterion(
-                outputs=_outputs, targets=detr_targets_flatten
+            _bl = min(detr_criterion_batch_len, detr_outputs["pred_logits"].shape[0])
+            _out_bl = {k: (v[:_bl] if isinstance(v, torch.Tensor) else v)
+                    for k, v in detr_outputs.items()
+                    if k not in ("aux_outputs", "enc_outputs")}
+            detr_loss_dict, detr_indices_bl = detr_criterion(
+                outputs=_out_bl, targets=detr_targets_flatten[:_bl]
             )
+            if _bl < detr_outputs["pred_logits"].shape[0]:
+                with torch.no_grad():
+                    _out_rest = {k: (v[_bl:] if isinstance(v, torch.Tensor) else v)
+                                for k, v in detr_outputs.items()
+                                if k not in ("aux_outputs", "enc_outputs")}
+                    _, detr_indices_rest = detr_criterion(
+                        outputs=_out_rest, targets=detr_targets_flatten[_bl:]
+                    )
+                detr_indices = detr_indices_bl + detr_indices_rest
+            else:
+                detr_indices = detr_indices_bl
         else:
             detr_loss_dict, detr_indices = detr_criterion(
                 outputs=detr_outputs, targets=detr_targets_flatten,
