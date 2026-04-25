@@ -157,19 +157,7 @@ class HungarianMatcher(nn.Module):
                     (np.concatenate([indice1[0], indice2[0] + g_num_queries * g_i]), np.concatenate([indice1[1], indice2[1]]))
                     for indice1, indice2 in zip(indices, indices_g)
                 ]
-        # Extract scalar matched cost for each (query, gt) pair.
-        # C[i] shape: (Q*G, N_t_sum). t_idxs are relative to batch element i,
-        # so offset by sum(sizes[:i]) to address the correct columns in C[i].
-        offsets = [sum(sizes[:i]) for i in range(len(sizes))]
-        matched_costs = []
-        for i, (q_idxs, t_idxs) in enumerate(indices):
-            costs_i = C[i][q_idxs, t_idxs + offsets[i]]   # (N_t_i * G,) float32 CPU
-            matched_costs.append(costs_i)
-
-        return (
-            [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices],
-            matched_costs,
-        )
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
 
 def build_matcher(args):
@@ -189,4 +177,3 @@ def build_matcher(args):
             cost_giou=args.set_cost_giou,
             focal_alpha=args.focal_alpha,
         )
-    
