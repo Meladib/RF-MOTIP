@@ -532,18 +532,19 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
-    def forward(self, outputs, targets):
+    def forward(self, outputs, targets, **kwargs):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
+             **kwargs: absorbs batch_len and other MOTIP-side arguments (ignored here).
         """
         group_detr = self.group_detr if self.training else 1
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets, group_detr=group_detr)
+        indices, matched_costs = self.matcher(outputs_without_aux, targets, group_detr=group_detr)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -562,29 +563,27 @@ class SetCriterion(nn.Module):
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                indices = self.matcher(aux_outputs, targets, group_detr=group_detr)
+                indices_aux, _ = self.matcher(aux_outputs, targets, group_detr=group_detr)
                 for loss in self.losses:
-                    kwargs = {}
+                    aux_kwargs = {}
                     if loss == 'labels':
-                        # Logging is enabled only for the last layer
-                        kwargs = {'log': False}
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                        aux_kwargs = {'log': False}
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices_aux, num_boxes, **aux_kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
         if 'enc_outputs' in outputs:
             enc_outputs = outputs['enc_outputs']
-            indices = self.matcher(enc_outputs, targets, group_detr=group_detr)
+            indices_enc, _ = self.matcher(enc_outputs, targets, group_detr=group_detr)
             for loss in self.losses:
-                kwargs = {}
+                enc_kwargs = {}
                 if loss == 'labels':
-                    # Logging is enabled only for the last layer
-                    kwargs['log'] = False
-                l_dict = self.get_loss(loss, enc_outputs, targets, indices, num_boxes, **kwargs)
+                    enc_kwargs['log'] = False
+                l_dict = self.get_loss(loss, enc_outputs, targets, indices_enc, num_boxes, **enc_kwargs)
                 l_dict = {k + f'_enc': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
-        return losses, indices 
+        return losses, indices, matched_costs
 
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
