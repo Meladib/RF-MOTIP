@@ -6,11 +6,10 @@ import argparse
 from .motip import MOTIP
 from structures.args import Args
 
-from models.deformable_detr.deformable_detr import build as build_deformable_detr
-from models.rfdetr.models.lwdetr import build_model, build_criterion_and_postprocessors
 
 from models.motip.trajectory_modeling import TrajectoryModeling
 from models.motip.id_decoder import IDDecoder
+from models.motip.canonicalization import GroupAnchorAggregation
 
 
 torch.serialization.add_safe_globals([argparse.Namespace])
@@ -53,10 +52,12 @@ def build(config: dict):
     #UPDATE 2: import the same config from the previous finetuning of rf-detr small 
     match detr_framework:
         case "deformable_detr":
+            from models.deformable_detr.deformable_detr import build as build_deformable_detr
             detr, detr_criterion, _ = build_deformable_detr(args=detr_args)
     #UPDATE 2: import the same config from the previous finetuning of rf-detr small 
     #UPDATE 2.1: add the rf_detr case and associate the config
         case "rf_detr":
+            from models.rfdetr.models.lwdetr import build_model, build_criterion_and_postprocessors
             ckpt_path = config["CKPT_PATH"]
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             args_ckpt = ckpt["args"]
@@ -93,5 +94,15 @@ def build(config: dict):
         trajectory_modeling=_trajectory_modeling,
         id_decoder=_id_decoder,
     )
+
+    # Register GroupAnchorAggregation for rf_detr (Phase 2 cost-weighted aggregation).
+    if detr_framework == "rf_detr":
+        _group_detr = ckpt["args"].group_detr
+        motip_model.group_anchor_agg = GroupAnchorAggregation(
+            num_groups=_group_detr,
+            init_tau=0.1,
+        )
+    else:
+        motip_model.group_anchor_agg = None
 
     return motip_model, detr_criterion
