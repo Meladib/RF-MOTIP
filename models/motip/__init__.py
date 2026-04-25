@@ -9,7 +9,6 @@ from structures.args import Args
 
 from models.motip.trajectory_modeling import TrajectoryModeling
 from models.motip.id_decoder import IDDecoder
-from models.motip.canonicalization import GroupAnchorAggregation
 
 
 torch.serialization.add_safe_globals([argparse.Namespace])
@@ -94,15 +93,5 @@ def build(config: dict):
         trajectory_modeling=_trajectory_modeling,
         id_decoder=_id_decoder,
     )
-
-    # Register GroupAnchorAggregation for rf_detr (Phase 2 cost-weighted aggregation).
-    if detr_framework == "rf_detr":
-        _group_detr = ckpt["args"].group_detr
-        motip_model.group_anchor_agg = GroupAnchorAggregation(
-            num_groups=_group_detr,
-            init_tau=0.1,
-        )
-    else:
-        motip_model.group_anchor_agg = None
 
     return motip_model, detr_criterion
