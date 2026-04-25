@@ -418,39 +418,24 @@ def train_one_epoch(
         detr_outputs = tensor_dict_index_select(detr_outputs, index=go_back_frame_idxs_flatten, dim=0)
 
         # DETR criterion:
-        """
-        detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
-        """
-        if hasattr(detr_criterion, "group_detr"):
-            _bl = min(detr_criterion_batch_len, detr_outputs["pred_logits"].shape[0])
-            _out_bl = {k: (v[:_bl] if isinstance(v, torch.Tensor) else v)
-                    for k, v in detr_outputs.items()
-                    if k not in ("aux_outputs", "enc_outputs")}
-            detr_loss_dict, detr_indices_bl = detr_criterion(
-                outputs=_out_bl, targets=detr_targets_flatten[:_bl]
-            )
-            if _bl < detr_outputs["pred_logits"].shape[0]:
-                with torch.no_grad():
-                    _out_rest = {k: (v[_bl:] if isinstance(v, torch.Tensor) else v)
-                                for k, v in detr_outputs.items()
-                                if k not in ("aux_outputs", "enc_outputs")}
-                    _, detr_indices_rest = detr_criterion(
-                        outputs=_out_rest, targets=detr_targets_flatten[_bl:]
-                    )
-                detr_indices = detr_indices_bl + detr_indices_rest
-            else:
-                detr_indices = detr_indices_bl
+        # Deformable DETR returns (losses, indices); RF-DETR returns (losses, indices, matched_costs).
+        _detr_ret = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
+        if len(_detr_ret) == 3:
+            detr_loss_dict, detr_indices, detr_costs = _detr_ret
         else:
-            detr_loss_dict, detr_indices = detr_criterion(
-                outputs=detr_outputs, targets=detr_targets_flatten,
-                batch_len=detr_criterion_batch_len
-            )
+            detr_loss_dict, detr_indices = _detr_ret
+            detr_costs = None
+
         # Whether to only train the DETR, OR to train the MOTIP together:
         if not only_detr:
             _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
             # Need to prepare for MOTIP:
             seq_info = prepare_for_motip(
-                detr_outputs=detr_outputs, annotations=annotations, detr_indices=detr_indices,
+                detr_outputs=detr_outputs,
+                annotations=annotations,
+                detr_indices=detr_indices,
+                detr_costs=detr_costs,
+                model_gaa=get_model(model).group_anchor_agg,
             )
             seq_info = model(seq_info=seq_info, part="trajectory_modeling")
             id_logits, id_gts, id_masks = model(
@@ -524,6 +509,11 @@ def train_one_epoch(
             # Update them to the metrics:
             metrics.update(name="lr", value=_lr)
             metrics.update(name="max_cuda_mem(MB)", value=_max_cuda_memory)
+            # Log learnable temperature τ (rf_detr only):
+            _gaa = get_model(model).group_anchor_agg
+            if _gaa is not None:
+                metrics["tau"].clear()
+                metrics.update(name="tau", value=_gaa.tau)
             # Sync the metrics:
             metrics.sync()
             eta = tps.eta(total_steps=len(dataloader), current_steps=step)
@@ -688,7 +678,8 @@ def tensor_dict_index_select(tensor_dict, index, dim=0):
     return dict(res_tensor_dict)
 
 
-def prepare_for_motip(detr_outputs, annotations, detr_indices):
+def prepare_for_motip(detr_outputs, annotations, detr_indices,
+                      detr_costs=None, model_gaa=None):
     _B, _T = len(annotations), len(annotations[0])
     _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
     _device = detr_outputs["pred_logits"].device
@@ -723,17 +714,29 @@ def prepare_for_motip(detr_outputs, annotations, detr_indices):
             sorted_pred_idxs    = pred_idxs[sort_order]
             sorted_pred_idxs_2d = sorted_pred_idxs.view(n_gt, G_det)   # (N_t, G_det)
             _gt_query_groups    = sorted_pred_idxs_2d    # retained for Phase 2 aggregation
-            # --- D: select column 0 (first group's match) as the A1 representative ---
-            selected_pred_idxs  = sorted_pred_idxs_2d[:, 0]             # (N_t,)
-            # --- E: gather embeddings/boxes — N_t rows, row j = GT j's features ---
-            detr_output_embeds  = detr_outputs["outputs"][flatten_idx][selected_pred_idxs]    # (N_t, D)
-            detr_boxes          = detr_outputs["pred_boxes"][flatten_idx][selected_pred_idxs]  # (N_t, 4)
+            # --- D/E: gather all G group embeddings per GT, then aggregate ---
+            # (N_t, G_det, D) — differentiable gather over all groups
+            all_embeds = detr_outputs["outputs"][flatten_idx][sorted_pred_idxs_2d]
+            if detr_costs is not None and model_gaa is not None:
+                # Cost-weighted softmax aggregation (Phase 2).
+                # raw_costs is in the same order as detr_indices[flatten_idx];
+                # apply sort_order to align with the GT-sorted sorted_pred_idxs_2d.
+                raw_costs = detr_costs[flatten_idx].to(detr_outputs["outputs"].device)
+                costs_2d  = raw_costs[sort_order].view(n_gt, G_det)   # (N_t, G_det)
+                valid_mask = torch.ones(n_gt, G_det, dtype=torch.bool,
+                                        device=detr_outputs["outputs"].device)
+                detr_output_embeds = model_gaa(all_embeds, costs_2d, valid_mask)  # (N_t, D)
+            else:
+                # Fallback: column-0 selection (Phase 1 / deformable_detr path).
+                detr_output_embeds = all_embeds[:, 0, :]   # (N_t, D)
+            detr_boxes = detr_outputs["pred_boxes"][flatten_idx][
+                sorted_pred_idxs_2d[:, 0]
+            ]   # (N_t, 4) — boxes from column-0 (best-cost group)
             # Gradient-flow guard (training mode only; integer indexing is differentiable).
             if detr_outputs["outputs"].requires_grad:
                 assert detr_output_embeds.requires_grad, (
-                    "Gradient flow broken at detr_output_embeds selection. "
-                    "Check that selected_pred_idxs is a long tensor and "
-                    "not accidentally wrapping a detach()."
+                    "Gradient flow broken at detr_output_embeds aggregation. "
+                    "Check that sorted_pred_idxs_2d is a long tensor."
                 )
             # detr_output_embeds = einops.repeat(detr_output_embeds, "n d -> g n d", g=_G)
             # detr_boxes = einops.repeat(detr_boxes, "n d -> g n d", g=_G)
