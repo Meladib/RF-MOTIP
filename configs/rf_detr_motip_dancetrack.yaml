@@ -33,5 +33,5 @@ AUG_NUM_GROUPS: 1
 SAMPLE_LENGTHS: [5]
 
 SCHEDULER_MILESTONES: [15, 18]
-RESUME_MODEL: ./outputs/rfmotip_dancetrack/checkpoint_2.pth
+
 NUM_TRAINING_IDS: 20
